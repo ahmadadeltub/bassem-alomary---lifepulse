@@ -1,158 +1,512 @@
+
+/*
+  ESP32 + AD8232 ECG + Nokia 5110 Graph + BPM + Buzzer + LEDs + Telegram Alert (POST)
+
+  ECG:
+    OUTPUT -> GPIO36 (VP)
+    LO+    -> GPIO32
+    LO-    -> GPIO33
+    3.3V   -> 3V3
+    GND    -> GND
+
+  Nokia 5110:
+    CLK -> 18
+    DIN -> 23
+    DC  -> 19
+    CE  -> 5
+    RST -> 14
+    BL  -> 27
+
+  Buzzer:
+    SIG -> GPIO26 (ACTIVE buzzer recommended)
+
+  LEDs:
+    Green -> GPIO13
+    Red   -> GPIO12
+
+  Telegram:
+    - Sends ALERT when BPM >= 150 for ~0.8s (stable)
+    - Repeats every 60s while still alert
+    - Sends NORMAL when BPM < 150 for 2s after being in alert
+*/
+
 #include <WiFi.h>
-#include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_PCD8544.h>
+#include <math.h>
 
-// ---------- Wi-Fi Settings ----------
-const char* WIFI_SSID = "Ahmad";
-const char* WIFI_PASS = "Tub01234";
+// ===================== WiFi / Telegram =====================
+const char* WIFI_SSID = "Ahmadmob";
+const char* WIFI_PASS = "123456789";
 
-// ---------- AD8232 Pins ----------
-static const int ECG_PIN   = 36;  // VP = GPIO36 (ADC1)
-static const int LO_PLUS   = 12;  // change to 27 if boot issues
-static const int LO_MINUS  = 13;
+const char* TG_TOKEN  = "8466468782:AAGJN7EE5mtZsluJo1Kqdgh8P4zbZ6zXj1E";
+const char* TG_CHATID = "1337613901";
 
-// ---------- Sampling ----------
-static const uint16_t SAMPLE_HZ = 250;            // ECG sampling rate
-static const uint32_t SAMPLE_US = 1000000UL / SAMPLE_HZ;
+// ===================== Nokia 5110 =====================
+#define CLK 18
+#define DIN 23
+#define DC  19
+#define CE  5
+#define RST 14
+#define BL  27
+Adafruit_PCD8544 display(CLK, DIN, DC, CE, RST);
 
-// Latest values shared with web page
-volatile uint16_t g_ecgRaw = 0;   // 0..4095
-volatile bool     g_leadsOff = false;
+// ===================== ECG (AD8232) =====================
+#define ECG_PIN   36
+#define LO_PLUS   32
+#define LO_MINUS  33
 
-WebServer server(80);
+// ===================== Alarm / LEDs =====================
+#define BUZZER_PIN 26
+#define BPM_ALARM  150
+#define GREEN_LED  13
+#define RED_LED    12
 
-// Simple HTML page that fetches /data many times per second
-const char INDEX_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>ESP32 ECG Test</title>
-  <style>
-    body{font-family:Arial, sans-serif; margin:16px;}
-    .box{padding:12px; border:1px solid #ddd; border-radius:12px; max-width:520px;}
-    .row{display:flex; justify-content:space-between; margin:8px 0;}
-    .bad{color:#b00020; font-weight:bold;}
-    .ok{color:#0b7a0b; font-weight:bold;}
-    code{background:#f6f6f6; padding:2px 6px; border-radius:6px;}
-  </style>
-</head>
-<body>
-  <h2>ESP32 + AD8232 ECG Live Test</h2>
-  <div class="box">
-    <div class="row"><div>Status:</div><div id="st">...</div></div>
-    <div class="row"><div>ECG raw (0..4095):</div><div><code id="v">0</code></div></div>
-    <div class="row"><div>Tip:</div><div>Open Serial Monitor for debug</div></div>
-  </div>
+// ===================== Sampling =====================
+static const uint16_t FS_HZ = 250;
+static const uint32_t FS_US = 1000000UL / FS_HZ;
 
-<script>
-async function poll(){
-  try{
-    const r = await fetch('/data');
-    const j = await r.json();
-    document.getElementById('v').textContent = j.ecg;
-    const st = document.getElementById('st');
-    if(j.leadsOff){
-      st.textContent = "LEADS OFF";
-      st.className = "bad";
-    } else {
-      st.textContent = "OK";
-      st.className = "ok";
+// ===================== Filtering =====================
+static const float DC_ALPHA = 0.995f;
+static const float SMOOTH_ALPHA = 0.20f;
+float dc_est = 0.0f;
+float smooth = 0.0f;
+
+// ===================== LCD layout =====================
+static const int LCD_W = 84;
+static const int LCD_H = 48;
+
+// two text lines => move chart down
+static const int TOP = 16;
+
+static const int PLOT_X = 0;
+static const int PLOT_Y = TOP;
+static const int PLOT_W = 84;
+static const int PLOT_H = 48 - TOP;
+
+static const int WAVE_W = 84;
+static const int WAVE_H = 48 - TOP;
+
+int8_t waveY[WAVE_W];
+int16_t minV = 32767, maxV = -32768;
+
+// ===================== BPM detection =====================
+int bpm = 0;
+unsigned long lastBeatMs = 0;
+float env = 0;
+float thr = 50;
+bool above = false;
+
+static const int MIN_BPM = 35;
+static const int MAX_BPM = 200;
+static const int REFRACTORY_MS = 250;
+
+volatile bool beatJustDetected = false;
+
+// ===================== URL encode =====================
+String urlEncode(const String &s) {
+  String out;
+  out.reserve(s.length() * 3);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum((unsigned char)c) || c=='-' || c=='_' || c=='.' || c=='~') out += c;
+    else if (c == ' ') out += "%20";
+    else {
+      char buf[4];
+      sprintf(buf, "%%%02X", (unsigned char)c);
+      out += buf;
     }
-  }catch(e){}
-  requestAnimationFrame(poll);
-}
-poll();
-</script>
-</body>
-</html>
-)HTML";
-
-void handleRoot() {
-  server.send(200, "text/html", INDEX_HTML);
+  }
+  return out;
 }
 
-void handleData() {
-  // Copy volatile to local quickly
-  uint16_t v = g_ecgRaw;
-  bool off = g_leadsOff;
+// ===================== WiFi connect / keep alive =====================
+void wifiEnsureConnected() {
+  if (WiFi.status() == WL_CONNECTED) return;
 
-  String json = "{";
-  json += "\"ecg\":" + String(v) + ",";
-  json += "\"leadsOff\":" + String(off ? "true" : "false");
-  json += "}";
-  server.send(200, "application/json", json);
-}
-
-bool connectWiFi(uint32_t timeoutMs = 15000) {
+  Serial.println("⚠ WiFi reconnecting...");
+  WiFi.disconnect(true);
+  delay(200);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  Serial.print("Connecting to Wi-Fi");
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("✅ WiFi OK. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("❌ WiFi failed");
+  }
+}
+
+// ===================== Telegram send (POST, DNS -> IP) =====================
+bool telegramSendMessagePOST(const String &text) {
+  wifiEnsureConnected();
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  IPAddress tgIP;
+  if (!WiFi.hostByName("api.telegram.org", tgIP)) {
+    Serial.println("❌ DNS failed: api.telegram.org");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15000);
+
+  if (!client.connect(tgIP, 443)) {
+    Serial.println("❌ Telegram connect failed (IP:443)");
+    return false;
+  }
+
+  String url = String("/bot") + TG_TOKEN + "/sendMessage";
+  String payload = "chat_id=" + String(TG_CHATID) + "&text=" + urlEncode(text);
+
+  client.print(String("POST ") + url + " HTTP/1.1\r\n");
+  client.print("Host: api.telegram.org\r\n");
+  client.print("Content-Type: application/x-www-form-urlencoded\r\n");
+  client.print("Connection: close\r\n");
+  client.print(String("Content-Length: ") + payload.length() + "\r\n\r\n");
+  client.print(payload);
+
+  Serial.println("----- Telegram reply -----");
+  while (client.connected() || client.available()) {
+    if (client.available()) Serial.write(client.read());
+  }
+  Serial.println("\n----- end -----");
+
+  client.stop();
+  return true;
+}
+
+// ===================== Graph helpers =====================
+int mapToWaveY(int16_t v) {
+  if (v < minV) minV = v;
+  if (v > maxV) maxV = v;
+
+  int16_t range = (maxV - minV);
+  if (range < 200) range = 200;
+
+  int y = (int)((long)(v - minV) * (WAVE_H - 3) / range);
+  y = (WAVE_H - 3) - y;
+
+  if (y < 1) y = 1;
+  if (y > WAVE_H - 2) y = WAVE_H - 2;
+  return y;
+}
+
+void drawPlotFrameAndGrid() {
+  display.drawRect(PLOT_X, PLOT_Y, PLOT_W, PLOT_H, BLACK);
+
+  for (int x = PLOT_X + 10; x < PLOT_X + PLOT_W - 1; x += 10) {
+    for (int y = PLOT_Y + 1; y < PLOT_Y + PLOT_H - 1; y += 2) display.drawPixel(x, y, BLACK);
+  }
+  for (int y = PLOT_Y + 8; y < PLOT_Y + PLOT_H - 1; y += 8) {
+    for (int x = PLOT_X + 1; x < PLOT_X + PLOT_W - 1; x += 2) display.drawPixel(x, y, BLACK);
+  }
+}
+
+void drawLCD(bool leadsOff) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(BLACK);
+
+  // Line 1: BPM + ECG label
+  display.setCursor(0, 0);
+  if (leadsOff) {
+    display.print("LEADS OFF");
+  } else {
+    display.print("BPM:");
+    if (bpm > 0) display.print(bpm);
+    else display.print("--");
+    display.print(" ECG");
+  }
+
+  // Line 2: ECG state only (no STATUS word)
+  display.setCursor(0, 8);
+  if (leadsOff) display.print("ECG OFF");
+  else if (bpm >= BPM_ALARM) display.print("ECG ALERT");
+  else if (bpm > 0) display.print("ECG NORMAL");
+  else display.print("ECG ...");
+
+  drawPlotFrameAndGrid();
+
+  // waveform
+  for (int x = 2; x < WAVE_W; x++) {
+    int y1 = PLOT_Y + waveY[x - 1];
+    int y2 = PLOT_Y + waveY[x];
+
+    if (y1 < PLOT_Y + 1) y1 = PLOT_Y + 1;
+    if (y2 < PLOT_Y + 1) y2 = PLOT_Y + 1;
+    if (y1 > PLOT_Y + PLOT_H - 2) y1 = PLOT_Y + PLOT_H - 2;
+    if (y2 > PLOT_Y + PLOT_H - 2) y2 = PLOT_Y + PLOT_H - 2;
+
+    display.drawLine(x - 1, y1, x, y2, BLACK);
+  }
+
+  // cursor at newest sample
+  display.drawLine(LCD_W - 1, PLOT_Y + 1, LCD_W - 1, PLOT_Y + PLOT_H - 2, BLACK);
+
+  // beat marker
+  if (beatJustDetected && !leadsOff) {
+    int y = PLOT_Y + waveY[WAVE_W - 1];
+    display.drawLine(LCD_W - 4, y - 3, LCD_W - 4, y + 3, BLACK);
+    beatJustDetected = false;
+  }
+
+  display.display();
+}
+
+// ===================== Outputs =====================
+void buzzerUpdate(bool leadsOff) {
+  static unsigned long lastToggle = 0;
+  static bool buz = false;
+
+  if (!leadsOff && bpm >= BPM_ALARM) {
+    if (millis() - lastToggle > 200) {
+      lastToggle = millis();
+      buz = !buz;
+      digitalWrite(BUZZER_PIN, buz ? HIGH : LOW);
+    }
+  } else {
+    buz = false;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+void ledsUpdate(bool leadsOff) {
+  if (leadsOff || bpm == 0) {
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, LOW);
+    return;
+  }
+  if (bpm >= BPM_ALARM) {
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, HIGH);
+  } else {
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+  }
+}
+
+// ===================== Telegram alert logic (improved for jitter) =====================
+void telegramAlertUpdate(bool leadsOff, int16_t filtOut) {
+  static uint32_t aboveStartMs = 0;
+  static uint32_t belowStartMs = 0;
+  static uint32_t lastSentMs   = 0;
+  static bool inAlert          = false;
+
+  if (leadsOff || bpm == 0) {
+    aboveStartMs = 0;
+    belowStartMs = 0;
+    if (inAlert) {
+      inAlert = false;
+      lastSentMs = 0;
+      telegramSendMessagePOST("✅ ECG NORMAL\nBPM: --");
+    }
+    return;
+  }
+
+  bool alertNow = (bpm >= BPM_ALARM);
+
+  // ALERT path
+  if (alertNow) {
+    belowStartMs = 0;
+
+    if (aboveStartMs == 0) aboveStartMs = millis();
+
+    // confirm alert after 0.8s (handles jitter)
+    if (!inAlert && (millis() - aboveStartMs >= 800)) {
+      inAlert = true;
+      lastSentMs = millis();
+
+      String msg;
+      msg.reserve(220);
+      msg += "🚨 ECG ALERT\n";
+      msg += "ECG: ALERT\n";
+      msg += "BPM: " + String(bpm) + "\n";
+      msg += "Value: " + String((int)filtOut) + "\n";
+      telegramSendMessagePOST(msg);
+    }
+
+    // repeat each 60s while still alert
+    if (inAlert && (millis() - lastSentMs >= 60000)) {
+      lastSentMs = millis();
+
+      String msg;
+      msg.reserve(220);
+      msg += "🚨 ECG ALERT (repeat)\n";
+      msg += "BPM: " + String(bpm) + "\n";
+      msg += "Value: " + String((int)filtOut) + "\n";
+      telegramSendMessagePOST(msg);
+    }
+    return;
+  }
+
+  // NORMAL path
+  aboveStartMs = 0;
+
+  if (inAlert) {
+    if (belowStartMs == 0) belowStartMs = millis();
+
+    // must stay normal 2s before sending NORMAL
+    if (millis() - belowStartMs >= 2000) {
+      inAlert = false;
+      lastSentMs = 0;
+      belowStartMs = 0;
+
+      String msg;
+      msg.reserve(140);
+      msg += "✅ ECG NORMAL\n";
+      msg += "BPM: " + String(bpm) + "\n";
+      telegramSendMessagePOST(msg);
+    }
+  } else {
+    belowStartMs = 0;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(BL, OUTPUT); digitalWrite(BL, HIGH);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+
+  pinMode(LO_PLUS, INPUT);
+  pinMode(LO_MINUS, INPUT);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(ECG_PIN, ADC_11db);
+
+  display.begin();
+  display.setContrast(65);
+  display.setRotation(2);
+
+  for (int i = 0; i < WAVE_W; i++) waveY[i] = WAVE_H / 2;
+  lastBeatMs = millis();
+
+Serial.print(WIFI_SSID);
+  // WiFi connect
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting WiFi");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
     delay(300);
     Serial.print(".");
   }
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("Wi-Fi connected. IP: ");
+    Serial.print("✅ WiFi connected. IP: ");
     Serial.println(WiFi.localIP());
-    return true;
+    telegramSendMessagePOST("✅ LifePulse ECG device online");
+  } else {
+    Serial.println("❌ WiFi not connected");
   }
-
-  Serial.println("Wi-Fi connection failed.");
-  return false;
-}
-
-void setup() {
-  Serial.begin(115200);
-
-  pinMode(LO_PLUS, INPUT);
-  pinMode(LO_MINUS, INPUT);
-
-  // Set ADC resolution (ESP32 default is 12-bit: 0..4095)
-  analogReadResolution(12);
-
-  // Connect Wi-Fi
-  connectWiFi();
-
-  // Web server endpoints
-  server.on("/", handleRoot);
-  server.on("/data", handleData);
-  server.begin();
-  Serial.println("Web server started. Open the IP in your browser.");
 }
 
 void loop() {
-  // Handle web requests
-  server.handleClient();
-
-  // ECG sampling loop (non-blocking timing)
   static uint32_t lastUs = 0;
   uint32_t nowUs = micros();
-  if (nowUs - lastUs >= SAMPLE_US) {
-    lastUs = nowUs;
+  if (nowUs - lastUs < FS_US) return;
+  lastUs += FS_US;
 
-    int loP = digitalRead(LO_PLUS);
-    int loM = digitalRead(LO_MINUS);
+  bool leadsOff = (digitalRead(LO_PLUS) == HIGH) || (digitalRead(LO_MINUS) == HIGH);
+  int16_t filtOut = 0;
 
-    bool leadsOff = (loP == 1) || (loM == 1);
-    g_leadsOff = leadsOff;
+  if (!leadsOff) {
+    int raw = analogRead(ECG_PIN);
 
-    if (!leadsOff) {
-      g_ecgRaw = analogRead(ECG_PIN);
+    dc_est = DC_ALPHA * dc_est + (1.0f - DC_ALPHA) * raw;
+    float centered = (float)raw - dc_est;
+
+    smooth = SMOOTH_ALPHA * centered + (1.0f - SMOOTH_ALPHA) * smooth;
+
+    int v = (int)smooth;
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    filtOut = (int16_t)v;
+
+    // BPM detection
+    float a = fabs((float)filtOut);
+    env = 0.90f * env + 0.10f * a;
+    thr = 0.80f * thr + 0.20f * (env * 0.55f + 20.0f);
+
+    unsigned long ms = millis();
+
+    if (!above && (a > thr)) {
+      above = true;
+
+      if (ms - lastBeatMs > (unsigned long)REFRACTORY_MS) {
+        unsigned long dt = ms - lastBeatMs;
+        lastBeatMs = ms;
+
+        int candidate = (dt > 0) ? (int)(60000UL / dt) : 0;
+        if (candidate >= MIN_BPM && candidate <= MAX_BPM) {
+          if (bpm == 0) bpm = candidate;
+          else bpm = (int)(0.75f * bpm + 0.25f * candidate);
+          beatJustDetected = true;
+        }
+      }
     }
+    if (above && (a < thr * 0.60f)) above = false;
 
-    // Debug to Serial (not too fast)
-    static uint32_t lastPrint = 0;
-    if (millis() - lastPrint >= 200) {
-      lastPrint = millis();
-      Serial.print("LeadsOff=");
-      Serial.print(leadsOff);
-      Serial.print("  ECG=");
-      Serial.println(g_ecgRaw);
-    }
+  } else {
+    bpm = 0;
+    env = 0;
+    thr = 50;
+    above = false;
+    lastBeatMs = millis();
+    filtOut = 0;
+    beatJustDetected = false;
   }
+
+  // autoscale reset every ~3s
+  static uint16_t scaleTick = 0;
+  if (++scaleTick >= FS_HZ * 3) {
+    scaleTick = 0;
+    minV = 32767;
+    maxV = -32768;
+  }
+
+  // update LCD waveform buffer
+  for (int i = 0; i < WAVE_W - 1; i++) waveY[i] = waveY[i + 1];
+  waveY[WAVE_W - 1] = leadsOff ? (WAVE_H / 2) : (int8_t)mapToWaveY(filtOut);
+
+  // outputs
+  buzzerUpdate(leadsOff);
+  ledsUpdate(leadsOff);
+
+  // telegram alerts
+  telegramAlertUpdate(leadsOff, filtOut);
+
+  // LCD refresh ~25 FPS
+  static uint16_t lcdDiv = 0;
+  if (++lcdDiv >= (FS_HZ / 25)) {
+    lcdDiv = 0;
+    drawLCD(leadsOff);
+  }
+
+  // Optional: print BPM every 1s for debugging
+  // static uint32_t t=0;
+  // if(millis()-t>1000){ t=millis(); Serial.println(bpm); }
 }
+
+
+
+
