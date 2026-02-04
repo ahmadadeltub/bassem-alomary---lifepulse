@@ -1,21 +1,30 @@
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_PCD8544.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
 
-// ================= WiFi / Telegram =================
-const char* WIFI_SSID = "Ahmad";
-const char* WIFI_PASS = "Tub01234";
-const char* TG_TOKEN  = "8466468782:AAGJN7EE5mtZsluJo1Kqdgh8P4zbZ6zXj1E";
-const char* TG_CHATID = "1337613901";
+// ==========x======= WiFi / Telegram =================
+const char *WIFI_SSID = "lifepulse";
+const char *WIFI_PASS = "lifepulse";
+const char *TG_TOKEN = "8347048532:AAGRfxXqYIY9I9oGL4ahG5AOlY2uwkhQnK4";
+const char *TG_CHATID = "1337613901";
+
+// ================= FIXED LOCATION =================
+const double FIXED_LATITUDE = 25.41659115389304;
+const double FIXED_LONGITUDE = 51.41448459639726;
+const char *LOCATION_NAME = "Birzan Prep Independent Girls School";
+
+// ================= Web Server =================
+WebServer server(80);
 
 // ================= LCD =================
 #define LCD_CLK 18
 #define LCD_DIN 23
-#define LCD_DC  19
-#define LCD_CE  5
+#define LCD_DC 19
+#define LCD_CE 5
 #define LCD_RST 14
-#define LCD_BL  27
+#define LCD_BL 27
 Adafruit_PCD8544 display(LCD_CLK, LCD_DIN, LCD_DC, LCD_CE, LCD_RST);
 
 // ================= Heart Rate Sensor =================
@@ -23,9 +32,9 @@ Adafruit_PCD8544 display(LCD_CLK, LCD_DIN, LCD_DC, LCD_CE, LCD_RST);
 
 // ================= Outputs =================
 #define GREEN_LED 13
-#define RED_LED   12
-#define BUZZER    26
-#define HR_ALERT  100
+#define RED_LED 12
+#define BUZZER 26
+#define HR_ALERT 150
 
 // ================= Sampling =================
 #define SAMPLE_RATE 500
@@ -36,23 +45,451 @@ int bpm = 0;
 unsigned long lastBeat = 0;
 float smoothValue = 0;
 
-// ================= ECG ENGINE (still running in background) =================
-int ecgIndex = 0;
-bool ecgActive = false;
-int ecgHoldCounter = 0;
-#define ECG_SPEED 3
+// ================= History =================
+#define HISTORY_SIZE 60
+int bpmHistory[HISTORY_SIZE];
+int historyIndex = 0;
+unsigned long lastHistoryUpdate = 0;
 
 // ================= Buzzer Pattern =================
 unsigned long buzzerTimer = 0;
 bool buzzerState = false;
-
 bool alertSent = false;
 
-// ================= Telegram =================
+// ================= Web Page =================
+const char *htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LifePulse Monitor</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      min-height: 100vh;
+      color: #fff;
+      padding: 20px;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 30px;
+    }
+    h1 {
+      font-size: 2.5rem;
+      background: linear-gradient(90deg, #e94560, #ff6b6b);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .subtitle { color: #8892b0; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .card {
+      background: rgba(255, 255, 255, 0.05);
+      backdrop-filter: blur(10px);
+      border-radius: 20px;
+      padding: 25px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .card-title {
+      font-size: 1rem;
+      color: #8892b0;
+      margin-bottom: 15px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .heart-section {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 30px;
+    }
+    .heart-icon {
+      font-size: 80px;
+      filter: drop-shadow(0 0 20px rgba(233, 69, 96, 0.5));
+    }
+    .heart-icon.beat { animation: heartbeat 1s ease-in-out infinite; }
+    @keyframes heartbeat {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.15); }
+    }
+    .bpm-display { text-align: center; }
+    .bpm-value {
+      font-size: 5rem;
+      font-weight: bold;
+      background: linear-gradient(180deg, #fff, #e94560);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      line-height: 1;
+    }
+    .bpm-label { font-size: 1.5rem; color: #8892b0; }
+    .status-badge {
+      display: inline-block;
+      padding: 10px 25px;
+      border-radius: 50px;
+      font-weight: 600;
+      font-size: 1.1rem;
+      margin-top: 15px;
+    }
+    .status-badge.ok { background: rgba(74, 222, 128, 0.2); color: #4ade80; border: 2px solid #4ade80; }
+    .status-badge.alert { background: rgba(239, 68, 68, 0.2); color: #ef4444; border: 2px solid #ef4444; animation: pulse 1s infinite; }
+    .status-badge.no-signal { background: rgba(250, 204, 21, 0.2); color: #facc15; border: 2px solid #facc15; }
+    @keyframes pulse { 50% { opacity: 0.6; } }
+    .chart-container { height: 200px; position: relative; }
+    #chart {
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 10px;
+    }
+    .chart-labels {
+      display: flex;
+      justify-content: space-between;
+      color: #64748b;
+      font-size: 0.8rem;
+      margin-top: 10px;
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 15px;
+      text-align: center;
+    }
+    .stat-value { font-size: 2rem; font-weight: bold; color: #e94560; }
+    .stat-label { font-size: 0.85rem; color: #8892b0; }
+    .sound-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 15px;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 12px;
+      cursor: pointer;
+    }
+    .toggle-switch {
+      width: 60px;
+      height: 30px;
+      background: #333;
+      border-radius: 15px;
+      position: relative;
+      transition: 0.3s;
+    }
+    .toggle-switch.active { background: #4ade80; }
+    .toggle-switch::after {
+      content: '';
+      position: absolute;
+      width: 26px;
+      height: 26px;
+      background: white;
+      border-radius: 50%;
+      top: 2px;
+      left: 2px;
+      transition: 0.3s;
+    }
+    .toggle-switch.active::after { left: 32px; }
+    .alert-banner {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      background: linear-gradient(90deg, #dc2626, #ef4444);
+      padding: 20px;
+      text-align: center;
+      font-weight: bold;
+      font-size: 1.2rem;
+      z-index: 1000;
+      animation: shake 0.3s infinite;
+    }
+    @keyframes shake {
+      0%, 100% { transform: translateX(0); }
+      25% { transform: translateX(-5px); }
+      75% { transform: translateX(5px); }
+    }
+    .footer {
+      text-align: center;
+      margin-top: 30px;
+      color: #64748b;
+    }
+    .telegram-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(0, 136, 204, 0.2);
+      color: #0088cc;
+      padding: 8px 15px;
+      border-radius: 20px;
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="alert-banner" id="alertBanner">⚠️ HIGH HEART RATE ALERT! ⚠️</div>
+  
+  <div class="header">
+    <h1>❤️ LifePulse</h1>
+    <p class="subtitle">Real-Time Heart Rate Monitor</p>
+    <div class="telegram-badge" style="margin-top: 15px;">📱 Telegram Alerts Active</div>
+  </div>
+  
+  <div class="grid">
+    <!-- Heart Rate Card -->
+    <div class="card">
+      <div class="card-title">💓 Current Heart Rate</div>
+      <div class="heart-section">
+        <div class="heart-icon" id="heartIcon">❤️</div>
+        <div class="bpm-display">
+          <div class="bpm-value" id="bpmValue">--</div>
+          <div class="bpm-label">BPM</div>
+        </div>
+      </div>
+      <div style="text-align: center;">
+        <div class="status-badge no-signal" id="statusBadge">📡 Connecting...</div>
+      </div>
+    </div>
+    
+    <!-- History Chart Card -->
+    <div class="card">
+      <div class="card-title">📊 Heart Rate History (Last 60 sec)</div>
+      <div class="chart-container">
+        <canvas id="chart"></canvas>
+      </div>
+      <div class="chart-labels">
+        <span>60s ago</span>
+        <span>30s ago</span>
+        <span>Now</span>
+      </div>
+    </div>
+    
+    <!-- Stats Card -->
+    <div class="card">
+      <div class="card-title">📈 Statistics</div>
+      <div class="stats-grid">
+        <div>
+          <div class="stat-value" id="minBpm">--</div>
+          <div class="stat-label">Min BPM</div>
+        </div>
+        <div>
+          <div class="stat-value" id="avgBpm">--</div>
+          <div class="stat-label">Avg BPM</div>
+        </div>
+        <div>
+          <div class="stat-value" id="maxBpm">--</div>
+          <div class="stat-label">Max BPM</div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Sound Settings Card -->
+    <div class="card">
+      <div class="card-title">🔔 Alert Settings</div>
+      <div class="sound-toggle" onclick="toggleSound()">
+        <span>🔊 Sound Alerts</span>
+        <div class="toggle-switch" id="soundToggle"></div>
+      </div>
+      <p style="margin-top: 15px; color: #64748b; font-size: 0.9rem;">
+        Alert threshold: <strong style="color: #e94560;">150 BPM</strong><br>
+        Telegram & web alerts will trigger simultaneously
+      </p>
+    </div>
+  </div>
+  
+  <div class="footer">
+    <p>Created by Eng. Ahmad Tubaishat</p>
+  </div>
+
+  <!-- Alert Sound -->
+  <audio id="alertSound" loop>
+    <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdH2DgYF7dnR4fYOIiIWBe3d1d32EiYqIg354dHR6gYaJiYaDfnl1dHqAhoqKhoF7d3R2fIKHioqGgXt2c3Z8g4iLioaBe3Z0dnyDiIuKhoF6dXR2fIOIi4qGgXp1dHZ8g4iLioaBenV0dnyDiIuKhoF6dXR3fIOIi4qFgHp1dHd8g4iLioWAenV0d3yDiIuKhYB5dXR3fIOIi4qFgHl1dHd9g4iLioWAeXV0d32DiIuKhYB5dXR3fYOIi4qFgHl1dHd9g4iLioV/eXV0d32DiIuKhX95dXR3fYOIi4qFf3l1dHd9g4iLioV/eXV0eH2DiIuKhX95dXR4fYOIi4qFf3l1dHh9g4iLiYV/eXV1eH2CiIuJhX95dXV4fYKIi4mFf3l1dXh9goiLiYV/eXV1eH2CiIuJhX95dXV4fYKIi4mFf3l1dXh9goiLiYV/eXV1eH2CiIuJhX94dXV4fYKIi4mFf3h1dXh9goiLiYR/eHV1eH2CiIuJhH94dXV4fYKIi4mEf3h1dXl9goiLiYR/eHV1eX2CiIuJhH94dXV5fYKIi4mEf3h1dXl9goiLiYR/eHV1eX2CiIqJhH94dXV5fYKIiomEf3h1dXl9goiKiYR/eHV1eX2CiIqJhH94dXV5fYGIiomEf3h1dnl9gYiKiYR+eHV2eX2BiIqJhH54dXZ5fYGIiomEfnh1dnl9gYiKiYR+eHV2eX2BiIqJhH54dXZ5fYGIiomEfnh2dnl9gYiKiYR+eHZ2eX2BiIqJhH54dnZ5fYGIiomEfnh2dnl8gYiKiYR+eHZ2eXyBiIqJhH54dnZ5fIGIiomDfnh2dnl8gYiKiYN+eHZ2eXyBiImJg354dnZ5fIGIiYmDfnh2dnl8gYiJiYN+eHZ2eXyBiImJg354dnZ6fIGIiYmDfXh2dnp8gYiJiYN9eHZ2enyBiImJg314dnZ6fIGIiYmDfXh2dnp8gYiJiIN9eHZ2enyBiImIg314dnZ6fIGIiYiDfXh2dnp8gYiJiIN9eHZ3enyBiImIg314dnd6fIGIiYiDfXh2d3p8gYiJiIN9eHZ3enyBiImIg314dnd6fICIiYiDfXh2d3p8gIiJiIN9eHZ3enyAiImIg314dnd6fICIiYiCfXh2d3p8gIiJiIJ9eHZ3enyAiImIgn14dnd6fICIiYiCfXh2d3t8gIiIiIJ9eHZ3e3yAiIiIgn14dnd7fICIiIiCfXh3d3t8gIiIiIJ9eHd3e3yAiIiIgn14d3d7fICIiIiCfXh3d3t8gIiIiIJ8eHd3e3yAiIiIgnx4d3d7fICIiIiCfHh3d3t8gIiIiIJ8eHd3e3yAiIiIgXx4d3d7fICIiIiBfHh3d3t8gIiIiIF8eHd3e3yAiIiIgXx4d3d7e4CIiIiBfHh3eHt7gIiIiIF8eHd4e3uAiIiIgXx4d3h7e4CIiIiBfHh3eHt7gIiIiIF8eHd4e3uAiIeIgXx4d3h7e4CHh4iBfHh3eHt7gIeHiIF8eHd4e3uAh4eIgXx4eHh7e4CHh4iBfHh4eHt7gIeHiIF8eHh4e3uAh4eIgXx4eHh7e4CHh4iBe3h4eHt7gIeHiIF7eHh4e3uAh4eIgXt4eHh7e4CHh4iBe3h4eHt7gIeHiIF7eHh4e3t/h4eIgXt4eHh7e3+Hh4iBe3h4eHt7f4eHiIF7eHh4e3t/h4eIgHt4eHh7e3+Hh4iAe3h4eHt7f4eHiIB7eHh4e3t/h4aIgHt4eHh8e3+Gh4iAe3h4eHx7f4aHiIB7eHh4fHt/hoeIgHt4eHl8e3+Gh4iAe3h4eXx7f4aGiIB7eHh5fHt/hoaIgHt4eHl8e3+GhoiAe3h4eXx7f4aGh4B7eHh5fHt/hoaHgHt4eHl8e3+GhoeAe3h4eXx7f4aGh4B7eHh5fHt+hoaHgHt4eXl8e36GhoeAe3h5eXx7foaGh4B7eHl5fHt+hoaHgHt5eXl8e36GhoeAe3l5eXx7foaGh396eXl5fHt+hoaHf3p5eXl8e36Ghod/enl5eXx7foaGh395eXl5fHt+hoaHf3l5eXl8e36Ghod/eXl5eXx7foaGh395eXl5fHt+hYaHf3l5eXl8e36FhoeAeGE=" type="audio/wav">
+  </audio>
+
+  <script>
+    let soundEnabled = true;
+    let isAlerting = false;
+    let history = [];
+    const canvas = document.getElementById('chart');
+    const ctx = canvas.getContext('2d');
+    
+    function resizeCanvas() {
+      canvas.width = canvas.offsetWidth * 2;
+      canvas.height = canvas.offsetHeight * 2;
+      ctx.scale(2, 2);
+    }
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas);
+    
+    function toggleSound() {
+      soundEnabled = !soundEnabled;
+      document.getElementById('soundToggle').classList.toggle('active', soundEnabled);
+      if (!soundEnabled) {
+        document.getElementById('alertSound').pause();
+      }
+    }
+    document.getElementById('soundToggle').classList.add('active');
+    
+    function drawChart(data) {
+      const w = canvas.offsetWidth;
+      const h = canvas.offsetHeight;
+      ctx.clearRect(0, 0, w, h);
+      
+      if (data.length < 2) return;
+      
+      const validData = data.filter(v => v > 0);
+      if (validData.length === 0) return;
+      
+      const minVal = Math.min(...validData) - 10;
+      const maxVal = Math.max(...validData) + 10;
+      const range = maxVal - minVal || 1;
+      
+      // Draw grid
+      ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++) {
+        const y = (h / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+      }
+      
+      // Draw threshold line
+      const thresholdY = h - ((150 - minVal) / range) * h;
+      ctx.strokeStyle = '#ef4444';
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.moveTo(0, thresholdY);
+      ctx.lineTo(w, thresholdY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      
+      // Draw line
+      ctx.strokeStyle = '#e94560';
+      ctx.lineWidth = 3;
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      
+      data.forEach((val, i) => {
+        if (val <= 0) return;
+        const x = (i / (data.length - 1)) * w;
+        const y = h - ((val - minVal) / range) * h;
+        if (i === 0 || data[i-1] <= 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      
+      // Fill gradient
+      ctx.lineTo(w, h);
+      ctx.lineTo(0, h);
+      ctx.closePath();
+      const gradient = ctx.createLinearGradient(0, 0, 0, h);
+      gradient.addColorStop(0, 'rgba(233, 69, 96, 0.3)');
+      gradient.addColorStop(1, 'rgba(233, 69, 96, 0)');
+      ctx.fillStyle = gradient;
+      ctx.fill();
+    }
+    
+    function updateData() {
+      fetch('/data')
+        .then(response => response.json())
+        .then(data => {
+          const bpmEl = document.getElementById('bpmValue');
+          const statusEl = document.getElementById('statusBadge');
+          const heartIcon = document.getElementById('heartIcon');
+          const alertBanner = document.getElementById('alertBanner');
+          const alertSound = document.getElementById('alertSound');
+          
+          history = data.history || [];
+          drawChart(history);
+          
+          // Calculate stats
+          const validHistory = history.filter(v => v > 0);
+          if (validHistory.length > 0) {
+            document.getElementById('minBpm').textContent = Math.min(...validHistory);
+            document.getElementById('avgBpm').textContent = Math.round(validHistory.reduce((a,b) => a+b, 0) / validHistory.length);
+            document.getElementById('maxBpm').textContent = Math.max(...validHistory);
+          }
+          
+          if (data.signal) {
+            bpmEl.textContent = data.bpm;
+            heartIcon.classList.add('beat');
+            
+            if (data.bpm > 150) {
+              statusEl.textContent = '🚨 HIGH HR ALERT!';
+              statusEl.className = 'status-badge alert';
+              alertBanner.style.display = 'block';
+              
+              if (soundEnabled && !isAlerting) {
+                alertSound.play();
+                isAlerting = true;
+              }
+            } else {
+              statusEl.textContent = '✅ Normal';
+              statusEl.className = 'status-badge ok';
+              alertBanner.style.display = 'none';
+              alertSound.pause();
+              alertSound.currentTime = 0;
+              isAlerting = false;
+            }
+          } else {
+            bpmEl.textContent = '--';
+            statusEl.textContent = '📡 No Signal';
+            statusEl.className = 'status-badge no-signal';
+            heartIcon.classList.remove('beat');
+            alertBanner.style.display = 'none';
+            alertSound.pause();
+            isAlerting = false;
+          }
+        })
+        .catch(() => {
+          document.getElementById('statusBadge').textContent = '❌ Connection Lost';
+          document.getElementById('statusBadge').className = 'status-badge alert';
+        });
+    }
+    
+    setInterval(updateData, 1000);
+    updateData();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ================= Handle Root =================
+void handleRoot() { server.send(200, "text/html", htmlPage); }
+
+// ================= Handle Data API =================
+void handleData() {
+  bool hasSignal = (millis() - lastBeat < 3000) && (bpm > 0);
+
+  String json = "{\"bpm\":" + String(bpm) +
+                ",\"signal\":" + (hasSignal ? "true" : "false") +
+                ",\"history\":[";
+  for (int i = 0; i < HISTORY_SIZE; i++) {
+    int idx = (historyIndex + i) % HISTORY_SIZE;
+    json += String(bpmHistory[idx]);
+    if (i < HISTORY_SIZE - 1)
+      json += ",";
+  }
+  json += "]}";
+
+  server.send(200, "application/json", json);
+}
+
+// ================= Telegram Send Message =================
 void sendTelegram(String msg) {
   WiFiClientSecure client;
   client.setInsecure();
-  if (!client.connect("api.telegram.org", 443)) return;
+  if (!client.connect("api.telegram.org", 443))
+    return;
 
   String payload = "chat_id=" + String(TG_CHATID) + "&text=" + msg;
   client.println("POST /bot" + String(TG_TOKEN) + "/sendMessage HTTP/1.1");
@@ -64,9 +501,47 @@ void sendTelegram(String msg) {
   client.stop();
 }
 
+// ================= Telegram Send Location =================
+void sendTelegramLocation(double lat, double lon) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  if (!client.connect("api.telegram.org", 443))
+    return;
+
+  String payload = "chat_id=" + String(TG_CHATID);
+  payload += "&latitude=" + String(lat, 6);
+  payload += "&longitude=" + String(lon, 6);
+
+  client.println("POST /bot" + String(TG_TOKEN) + "/sendLocation HTTP/1.1");
+  client.println("Host: api.telegram.org");
+  client.println("Content-Type: application/x-www-form-urlencoded");
+  client.println("Content-Length: " + String(payload.length()));
+  client.println();
+  client.print(payload);
+  client.stop();
+}
+
+// ================= Send Alert with Location =================
+void sendLocationAlert(int heartRate) {
+  String msg = "🚨 EMERGENCY ALERT!\n\n";
+  msg += "❤️ Heart Rate: " + String(heartRate) + " BPM\n";
+  msg += "⚠️ HR exceeds safe limit (150 BPM)\n\n";
+  msg += "📍 Location: " + String(LOCATION_NAME) + "\n";
+  msg += "🗺️ Map: https://maps.google.com/?q=" + String(FIXED_LATITUDE, 6) +
+         "," + String(FIXED_LONGITUDE, 6);
+
+  sendTelegram(msg);
+  delay(500);
+  sendTelegramLocation(FIXED_LATITUDE, FIXED_LONGITUDE);
+}
+
 // ================= Setup =================
 void setup() {
   Serial.begin(115200);
+
+  // Initialize history
+  for (int i = 0; i < HISTORY_SIZE; i++)
+    bpmHistory[i] = 0;
 
   pinMode(HR_SENSOR_PIN, INPUT);
   pinMode(GREEN_LED, OUTPUT);
@@ -86,16 +561,60 @@ void setup() {
   display.setCursor(10, 18);
   display.print("Life Pulse");
   display.display();
-  delay(2000);
+  delay(1000);
 
+  // Connect to WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) delay(300);
-  sendTelegram("✅ LifePulse Online");
+  display.clearDisplay();
+  display.setCursor(5, 18);
+  display.print("Connecting...");
+  display.display();
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Show IP on LCD
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("LifePulse");
+  display.setCursor(0, 16);
+  display.print("IP Address:");
+  display.setCursor(0, 28);
+  display.print(WiFi.localIP());
+  display.display();
+  delay(3000);
+
+  // Setup web server routes
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+
+  Serial.println("Web server started!");
+  sendTelegram("✅ LifePulse Online\n🌐 Web: http://" +
+               WiFi.localIP().toString() +
+               "\n📍 Location: " + String(LOCATION_NAME));
 }
 
 // ================= Loop =================
 void loop() {
-  if (millis() - lastSample < (1000 / SAMPLE_RATE)) return;
+  server.handleClient();
+
+  // Update history every second
+  if (millis() - lastHistoryUpdate >= 1000) {
+    lastHistoryUpdate = millis();
+    bool hasSignal = (millis() - lastBeat < 3000) && (bpm > 0);
+    bpmHistory[historyIndex] = hasSignal ? bpm : 0;
+    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+  }
+
+  if (millis() - lastSample < (1000 / SAMPLE_RATE))
+    return;
   lastSample = millis();
 
   int raw = analogRead(HR_SENSOR_PIN);
@@ -118,22 +637,24 @@ void loop() {
   lastSignal = signal;
 
   // ===== OUTPUTS =====
-  if (beat && bpm < HR_ALERT) tone(BUZZER, 1800, 40);
+  if (beat && bpm < HR_ALERT)
+    tone(BUZZER, 1800, 40);
 
   if (bpm > HR_ALERT) {
     digitalWrite(GREEN_LED, LOW);
     digitalWrite(RED_LED, HIGH);
 
-    // High beep – pause – high beep
     if (millis() - buzzerTimer >= 1000) {
       buzzerTimer = millis();
       buzzerState = !buzzerState;
-      if (buzzerState) tone(BUZZER, 2500);
-      else noTone(BUZZER);
+      if (buzzerState)
+        tone(BUZZER, 2500);
+      else
+        noTone(BUZZER);
     }
 
     if (!alertSent) {
-      sendTelegram("🚨 HR ALERT\nHR: " + String(bpm));
+      sendLocationAlert(bpm);
       alertSent = true;
     }
   } else {
@@ -151,11 +672,9 @@ void loop() {
 void drawLCD() {
   display.clearDisplay();
 
-  // ---- Title ----
   display.setCursor(16, 0);
   display.print("Life Pulse");
 
-  // ---- Heart Rate (center) ----
   display.setTextSize(2);
   display.setCursor(18, 16);
 
@@ -169,7 +688,6 @@ void drawLCD() {
   display.setTextSize(1);
   display.print("BPM");
 
-  // ---- Status ----
   display.setCursor(10, 38);
   display.print("STATUS: ");
 
